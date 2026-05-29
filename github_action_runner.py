@@ -1,6 +1,7 @@
 import os
 import json
 import smtplib
+import time
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime, timedelta
@@ -32,9 +33,22 @@ ETF_NAME = "红利低波ETF"
 RSI_PERIOD = 15  # RSI周期（使用EMA平滑）
 RSI_BUY_THRESHOLD = int(os.environ.get("RSI_BUY_THRESHOLD", 32))  # 买入阈值
 RSI_SELL_THRESHOLD = int(os.environ.get("RSI_SELL_THRESHOLD", 77))  # 卖出阈值
+DATA_FETCH_RETRIES = int(os.environ.get("DATA_FETCH_RETRIES", 3))
+DATA_FETCH_TIMEOUT = int(os.environ.get("DATA_FETCH_TIMEOUT", 20))
 
 BEST_PARAMS_PATH = os.path.join("backtest", "best_combined_params.json")
 BACKTEST_RESULT_PATH = os.path.join("backtest", "backtest_result.json")
+
+DATA_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://quote.eastmoney.com/",
+}
 
 
 def load_json_file(file_path):
@@ -176,34 +190,174 @@ def calculate_rsi_ema(prices, period):
     return rsi
 
 
+def normalize_etf_history(df, source_name, days):
+    """统一不同数据源的字段，并做基础清洗。"""
+    if df is None or df.empty:
+        raise ValueError(f"{source_name} 返回空数据")
+
+    column_map = {}
+    if "日期" in df.columns:
+        column_map["日期"] = "date"
+    if "收盘" in df.columns:
+        column_map["收盘"] = "close"
+    df = df.rename(columns=column_map)
+
+    missing_columns = {"date", "close"} - set(df.columns)
+    if missing_columns:
+        raise ValueError(f"{source_name} 缺少字段: {', '.join(sorted(missing_columns))}")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(f"{source_name} 清洗后无有效数据")
+
+    df = df.tail(days).reset_index(drop=True)
+    start_date = df["date"].min().strftime("%Y-%m-%d")
+    end_date = df["date"].max().strftime("%Y-%m-%d")
+    print(f"{source_name} 获取到 {len(df)} 条数据，从 {start_date} 到 {end_date}")
+    return df
+
+
+def fetch_etf_data_from_akshare(code, days):
+    """使用 AKShare 获取 ETF 前复权日线数据。"""
+    import akshare as ak
+
+    df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
+    return normalize_etf_history(df, "AKShare", days)
+
+
+def get_eastmoney_secids(code):
+    """生成东方财富 secid，ETF 512/510 等上海代码通常为 1.x。"""
+    preferred_market = "1" if code.startswith(("5", "6", "9")) else "0"
+    fallback_market = "0" if preferred_market == "1" else "1"
+    return [f"{preferred_market}.{code}", f"{fallback_market}.{code}"]
+
+
+def fetch_etf_data_from_eastmoney(code, days):
+    """直接调用东方财富 K 线接口，作为 AKShare 被断连时的备用数据源。"""
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    last_error = None
+    session = requests.Session()
+    session.trust_env = False
+
+    for secid in get_eastmoney_secids(code):
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "1",  # 前复权
+            "beg": "0",
+            "end": "20500101",
+        }
+        try:
+            response = session.get(
+                url,
+                params=params,
+                headers=DATA_REQUEST_HEADERS,
+                timeout=DATA_FETCH_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            klines = (payload.get("data") or {}).get("klines") or []
+            if not klines:
+                raise ValueError(f"东方财富 {secid} 无 K 线数据")
+
+            rows = []
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    rows.append({"date": parts[0], "close": parts[2]})
+
+            return normalize_etf_history(pd.DataFrame(rows), f"东方财富({secid})", days)
+        except Exception as e:
+            last_error = e
+            print(f"东方财富 {secid} 获取失败: {e}")
+
+    raise RuntimeError(f"东方财富备用数据源不可用: {last_error}")
+
+
+def get_sina_symbol(code):
+    """生成新浪行情 symbol，上海 ETF 使用 sh 前缀。"""
+    market_prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+    return f"{market_prefix}{code}"
+
+
+def fetch_etf_data_from_sina(code, days):
+    """调用新浪日线接口，作为行情源被断开时的第二备用数据源。"""
+    url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20data=/CN_MarketDataService.getKLineData"
+    symbol = get_sina_symbol(code)
+    session = requests.Session()
+    session.trust_env = False
+
+    response = session.get(
+        url,
+        params={
+            "symbol": symbol,
+            "scale": "240",
+            "ma": "no",
+            "datalen": str(max(days, RSI_PERIOD + 5)),
+        },
+        headers=DATA_REQUEST_HEADERS,
+        timeout=DATA_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    text = response.text
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("新浪返回内容不是有效的 JSONP K 线数据")
+
+    rows = [
+        {"date": item.get("day"), "close": item.get("close")}
+        for item in json.loads(text[start : end + 1])
+    ]
+    return normalize_etf_history(pd.DataFrame(rows), f"新浪({symbol})", days)
+
+
+def fetch_with_retries(source_name, fetcher):
+    """对容易被 GitHub Actions 网络波动影响的数据源做短重试。"""
+    last_error = None
+    retries = max(1, DATA_FETCH_RETRIES)
+
+    for attempt in range(1, retries + 1):
+        try:
+            return fetcher()
+        except Exception as e:
+            last_error = e
+            print(f"{source_name} 第 {attempt}/{retries} 次获取失败: {e}")
+            if attempt < retries:
+                time.sleep(min(2 * attempt, 8))
+
+    print(f"{source_name} 多次获取失败，准备切换数据源: {last_error}")
+    return None
+
+
 def fetch_etf_data(code, days=60):
     """
-    使用 akshare 获取ETF历史数据
-    返回最近N天的数据用于计算RSI
+    获取ETF历史数据。
+    优先使用 AKShare；若 GitHub Actions 网络被对端断开，则回退到东方财富直连接口。
     """
-    import akshare as ak
-    
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始获取 {code} 数据...")
-    
-    try:
-        # 获取ETF日线数据（前复权）
-        df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
-        df['日期'] = pd.to_datetime(df['日期'])
-        df = df.rename(columns={
-            '日期': 'date',
-            '收盘': 'close'
-        })
-        df = df.sort_values('date').reset_index(drop=True)
-        
-        # 只取最近N天
-        df = df.tail(days).reset_index(drop=True)
-        
-        print(f"获取到 {len(df)} 条数据，从 {df['date'].min()} 到 {df['date'].max()}")
-        return df
-        
-    except Exception as e:
-        print(f"获取ETF数据失败: {e}")
-        return None
+
+    data_sources = [
+        ("AKShare", lambda: fetch_etf_data_from_akshare(code, days)),
+        ("东方财富备用接口", lambda: fetch_etf_data_from_eastmoney(code, days)),
+        ("新浪备用接口", lambda: fetch_etf_data_from_sina(code, days)),
+    ]
+
+    for source_name, fetcher in data_sources:
+        df = fetch_with_retries(source_name, fetcher)
+        if df is not None:
+            return df
+
+    print("获取ETF数据失败: 所有数据源均不可用")
+    return None
 
 
 def fetch_rsi_and_price():
@@ -309,7 +463,7 @@ def main():
     
     if rsi is None:
         print("未能获取有效 RSI 数据，程序结束。")
-        return
+        raise SystemExit(1)
 
     print(f"当前状态: RSI={rsi}, 价格={price}")
 
