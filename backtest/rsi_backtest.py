@@ -7,10 +7,18 @@
 
 import pandas as pd
 import numpy as np
-import akshare as ak
 from datetime import datetime
 import json
 import os
+import time
+import requests
+
+try:
+    import akshare as ak
+    AKSHARE_IMPORT_ERROR = None
+except Exception as e:
+    ak = None
+    AKSHARE_IMPORT_ERROR = e
 
 # ============ 配置参数 ============
 ETF_CODE = "512890"
@@ -19,6 +27,20 @@ RSI_PERIOD = 15  # 优化后：15日（原14日）
 RSI_BUY_THRESHOLD = 32  # 优化后：32（原66）
 RSI_SELL_THRESHOLD = 77  # 优化后：77（原81）
 INITIAL_CAPITAL = 100000  # 初始资金10万
+DATA_FETCH_RETRIES = int(os.environ.get("DATA_FETCH_RETRIES", 3))
+DATA_FETCH_TIMEOUT = int(os.environ.get("DATA_FETCH_TIMEOUT", 20))
+SINA_DATALEN = int(os.environ.get("SINA_DATALEN", 1800))
+
+DATA_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://quote.eastmoney.com/",
+}
 
 # 基准ETF配置
 BENCHMARK_ETFS = {
@@ -57,27 +79,251 @@ def calculate_rsi(prices, period=15):
 
 
 # ============ 获取数据 ============
+def normalize_etf_history(df, source_name, adjusted=True):
+    """统一 ETF 历史行情字段，并做基础清洗。"""
+    if df is None or df.empty:
+        raise ValueError(f"{source_name} 返回空数据")
+
+    column_map = {
+        '日期': 'date',
+        '开盘': 'open',
+        '收盘': 'close',
+        '最高': 'high',
+        '最低': 'low',
+        '成交量': 'volume',
+    }
+    df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
+
+    missing_columns = {'date', 'close'} - set(df.columns)
+    if missing_columns:
+        raise ValueError(f"{source_name} 缺少字段: {', '.join(sorted(missing_columns))}")
+
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    for column in ['open', 'high', 'low', 'volume']:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors='coerce')
+
+    df = df.dropna(subset=['date', 'close'])
+    df = df.sort_values('date').drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"{source_name} 清洗后无有效数据")
+
+    start_date = df['date'].min().strftime('%Y-%m-%d')
+    end_date = df['date'].max().strftime('%Y-%m-%d')
+    print(f"{source_name} 获取到 {len(df)} 条数据，从 {start_date} 到 {end_date}")
+    df.attrs['source_name'] = source_name
+    df.attrs['adjusted'] = adjusted
+    return df
+
+
+def fetch_etf_data_from_akshare(code):
+    """使用 AKShare 获取 ETF 前复权日线数据。"""
+    if ak is None:
+        raise RuntimeError(f"AKShare 导入失败: {AKSHARE_IMPORT_ERROR}")
+
+    df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
+    return normalize_etf_history(df, "AKShare")
+
+
+def get_eastmoney_secids(code):
+    """生成东方财富 secid，ETF 512/510 等上海代码通常为 1.x。"""
+    preferred_market = "1" if code.startswith(("5", "6", "9")) else "0"
+    fallback_market = "0" if preferred_market == "1" else "1"
+    return [f"{preferred_market}.{code}", f"{fallback_market}.{code}"]
+
+
+def fetch_etf_data_from_eastmoney(code):
+    """直接调用东方财富 K 线接口，作为 AKShare 被断连时的备用数据源。"""
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    last_error = None
+    session = requests.Session()
+    session.trust_env = False
+
+    for secid in get_eastmoney_secids(code):
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "1",  # 前复权
+            "beg": "0",
+            "end": "20500101",
+        }
+        try:
+            response = session.get(
+                url,
+                params=params,
+                headers=DATA_REQUEST_HEADERS,
+                timeout=DATA_FETCH_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            klines = (payload.get("data") or {}).get("klines") or []
+            if not klines:
+                raise ValueError(f"东方财富 {secid} 无 K 线数据")
+
+            rows = []
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) >= 6:
+                    rows.append({
+                        "date": parts[0],
+                        "open": parts[1],
+                        "close": parts[2],
+                        "high": parts[3],
+                        "low": parts[4],
+                        "volume": parts[5],
+                    })
+
+            return normalize_etf_history(pd.DataFrame(rows), f"东方财富({secid})")
+        except Exception as e:
+            last_error = e
+            print(f"东方财富 {secid} 获取失败: {e}")
+
+    raise RuntimeError(f"东方财富备用数据源不可用: {last_error}")
+
+
+def get_sina_symbol(code):
+    """生成新浪行情 symbol，上海 ETF 使用 sh 前缀。"""
+    market_prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+    return f"{market_prefix}{code}"
+
+
+def fetch_etf_data_from_sina(code):
+    """调用新浪日线接口，作为行情源被断开时的第二备用数据源。"""
+    url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20data=/CN_MarketDataService.getKLineData"
+    symbol = get_sina_symbol(code)
+    session = requests.Session()
+    session.trust_env = False
+    datalen_candidates = []
+    for datalen in [SINA_DATALEN, 1800, 1500, 1000, 500]:
+        if datalen > 0 and datalen not in datalen_candidates:
+            datalen_candidates.append(datalen)
+
+    last_error = None
+    for datalen in datalen_candidates:
+        try:
+            response = session.get(
+                url,
+                params={
+                    "symbol": symbol,
+                    "scale": "240",
+                    "ma": "no",
+                    "datalen": str(datalen),
+                },
+                headers=DATA_REQUEST_HEADERS,
+                timeout=DATA_FETCH_TIMEOUT,
+            )
+            response.raise_for_status()
+
+            text = response.text
+            start = text.find("[")
+            end = text.rfind("]")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(f"新浪 datalen={datalen} 返回内容不是有效的 JSONP K 线数据")
+
+            rows = [
+                {
+                    "date": item.get("day"),
+                    "open": item.get("open"),
+                    "close": item.get("close"),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "volume": item.get("volume"),
+                }
+                for item in json.loads(text[start : end + 1])
+            ]
+            return normalize_etf_history(pd.DataFrame(rows), f"新浪({symbol}, datalen={datalen})", adjusted=False)
+        except Exception as e:
+            last_error = e
+            print(f"新浪 {symbol} datalen={datalen} 获取失败: {e}")
+
+    raise RuntimeError(f"新浪备用数据源不可用: {last_error}")
+
+
+def fetch_with_retries(source_name, fetcher):
+    """对容易被 GitHub Actions 网络波动影响的数据源做短重试。"""
+    last_error = None
+    retries = max(1, DATA_FETCH_RETRIES)
+
+    for attempt in range(1, retries + 1):
+        try:
+            return fetcher()
+        except Exception as e:
+            last_error = e
+            print(f"{source_name} 第 {attempt}/{retries} 次获取失败: {e}")
+            if attempt < retries:
+                time.sleep(min(2 * attempt, 8))
+
+    print(f"{source_name} 多次获取失败，准备切换数据源: {last_error}")
+    return None
+
+
 def get_etf_data(code):
     """获取ETF日线数据"""
     print(f"正在获取 {code} 历史数据...")
-    try:
-        # 获取ETF日线数据
-        df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
-        df['日期'] = pd.to_datetime(df['日期'])
-        df = df.rename(columns={
-            '日期': 'date',
-            '开盘': 'open',
-            '收盘': 'close',
-            '最高': 'high',
-            '最低': 'low',
-            '成交量': 'volume'
-        })
-        df = df.sort_values('date').reset_index(drop=True)
-        print(f"获取到 {len(df)} 条数据，从 {df['date'].min()} 到 {df['date'].max()}")
-        return df
-    except Exception as e:
-        print(f"获取ETF数据失败: {e}")
+
+    data_sources = [
+        ("AKShare", lambda: fetch_etf_data_from_akshare(code)),
+        ("东方财富备用接口", lambda: fetch_etf_data_from_eastmoney(code)),
+        ("新浪备用接口", lambda: fetch_etf_data_from_sina(code)),
+    ]
+
+    for source_name, fetcher in data_sources:
+        df = fetch_with_retries(source_name, fetcher)
+        if df is not None:
+            return df
+
+    print("获取ETF数据失败: 所有数据源均不可用")
+    return None
+
+
+def cached_strategy_prices(previous_result):
+    """从上次回测结果中恢复主 ETF 的前复权收盘价缓存。"""
+    strategy_values = ((previous_result or {}).get('daily_values') or {}).get('strategy') or []
+    rows = [
+        {'date': item.get('date'), 'close': item.get('close')}
+        for item in strategy_values
+        if item.get('date') and item.get('close') is not None
+    ]
+    if not rows:
         return None
+
+    try:
+        return normalize_etf_history(pd.DataFrame(rows), "缓存前复权历史")
+    except Exception as e:
+        print(f"读取缓存前复权历史失败: {e}")
+        return None
+
+
+def merge_with_cached_adjusted_history(df, previous_result):
+    """新浪历史价未复权；仅用它补充缓存之后的新交易日，保持回测口径稳定。"""
+    if df is None or df.attrs.get('adjusted', True):
+        return df
+
+    cached_df = cached_strategy_prices(previous_result)
+    if cached_df is None or cached_df.empty:
+        print("未找到可用的前复权历史缓存，继续使用当前数据源。")
+        return df
+
+    latest_cached_date = cached_df['date'].max()
+    new_rows = df[df['date'] > latest_cached_date][['date', 'close']].copy()
+
+    if new_rows.empty:
+        print(f"当前数据源为未复权历史价，使用缓存前复权历史至 {latest_cached_date.strftime('%Y-%m-%d')}")
+        return cached_df
+
+    merged = pd.concat([cached_df[['date', 'close']], new_rows], ignore_index=True)
+    merged = merged.sort_values('date').drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
+    merged.attrs['source_name'] = f"{cached_df.attrs.get('source_name', '缓存')} + {df.attrs.get('source_name', '新浪')} 新数据"
+    merged.attrs['adjusted'] = True
+    print(
+        f"使用缓存前复权历史 {len(cached_df)} 条，追加 {len(new_rows)} 条新数据，"
+        f"最新日期 {merged['date'].max().strftime('%Y-%m-%d')}"
+    )
+    return merged
 
 
 def get_benchmark_data(code, name, index_type="index"):
@@ -344,12 +590,19 @@ def main():
     print("=" * 60)
     print("红利低波ETF (512890) RSI策略回测")
     print("=" * 60)
+
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+    output_file = os.path.join(output_dir, "backtest_result.json")
+    previous_result = load_previous_result(output_file)
+    previous_stats = previous_result.get('statistics', {}) if previous_result else {}
+    previous_daily = previous_result.get('daily_values', {}) if previous_result else {}
     
     # 1. 获取数据
     etf_df = get_etf_data(ETF_CODE)
     if etf_df is None:
         print("无法获取ETF数据，退出")
         return
+    etf_df = merge_with_cached_adjusted_history(etf_df, previous_result)
     
     # 2. 统一时间范围
     start_date = etf_df['date'].min()
@@ -357,20 +610,15 @@ def main():
     print(f"\n回测区间: {start_date.strftime('%Y-%m-%d')} 至 {end_date.strftime('%Y-%m-%d')}")
     
     # 3. 获取基准ETF数据
-    output_dir = os.path.dirname(os.path.abspath(__file__))
-    output_file = os.path.join(output_dir, "backtest_result.json")
-    previous_result = load_previous_result(output_file)
-    previous_stats = previous_result.get('statistics', {}) if previous_result else {}
-    previous_daily = previous_result.get('daily_values', {}) if previous_result else {}
-
     benchmark_data = {}
     for key, info in BENCHMARK_ETFS.items():
         print(f"正在获取 {info['name']} ({info['code']}) 数据...")
         try:
-            df = ak.fund_etf_hist_em(symbol=info['code'], period="daily", adjust="qfq")
-            df['日期'] = pd.to_datetime(df['日期'])
-            df = df.rename(columns={'日期': 'date', '收盘': 'close'})
-            df = df.sort_values('date').reset_index(drop=True)
+            df = get_etf_data(info['code'])
+            if df is None:
+                raise RuntimeError("所有数据源均不可用")
+            if not df.attrs.get('adjusted', True):
+                raise RuntimeError(f"{df.attrs.get('source_name', '当前数据源')} 为未复权历史价，使用上次基准结果兜底")
             # 筛选到相同时间范围
             df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
             benchmark_data[key] = df[['date', 'close']]
