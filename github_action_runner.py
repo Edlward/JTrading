@@ -1,9 +1,11 @@
 import os
 import json
+import re
 import smtplib
 import time
 from email.mime.text import MIMEText
 from email.header import Header
+from email.utils import formataddr
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
@@ -20,7 +22,11 @@ SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY")
 # Gist 订阅者列表配置
 GIST_SUBSCRIBERS_URL = os.environ.get("GIST_SUBSCRIBERS_URL")
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_TOKEN = os.environ.get("GIST_TOKEN") or os.environ.get("GIST_TOKEN_READ") or os.environ.get("GIST_TOKEN_WRITE")
+GIST_ID = os.environ.get("GIST_ID")
+GIST_FILENAME = os.environ.get("GIST_FILENAME") or "subscribers.txt"
+EMAIL_BATCH_SIZE = 10
+EMAIL_BATCH_DELAY_SECONDS = 2
 
 # ==========================================
 # 最优策略参数配置 (来自回测优化结果)
@@ -49,6 +55,8 @@ DATA_REQUEST_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://quote.eastmoney.com/",
 }
+
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 def load_json_file(file_path):
@@ -133,42 +141,99 @@ def compute_dynamic_signal(rsi_value, close_series, params):
         "signal_color": signal_color,
     }
 
+def parse_subscriber_emails(content, include_pending=False):
+    """解析订阅者邮箱，支持换行、逗号/分号分隔和 [pending]/[confirmed] 标记。"""
+    emails = []
+    seen = set()
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        status_match = re.match(r"^\[(pending|confirmed)\]\s*(.+)$", line, re.IGNORECASE)
+        if status_match:
+            status = status_match.group(1).lower()
+            line = status_match.group(2).strip()
+            if status == "pending" and not include_pending:
+                continue
+
+        for candidate in re.split(r"[,;，；\s]+", line):
+            email = candidate.strip()
+            if not email:
+                continue
+            if not EMAIL_PATTERN.match(email):
+                print(f"跳过无效订阅邮箱: {email}")
+                continue
+
+            key = email.lower()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            emails.append(email)
+
+    return emails
+
+
+def fetch_gist_subscriber_content():
+    """优先从 raw URL 读取 Gist；未配置 raw URL 时回退到 Gist API。"""
+    if not GIST_TOKEN:
+        return None
+
+    headers_raw = {
+        'Authorization': f'token {GIST_TOKEN}',
+        'Accept': 'application/vnd.github.v3.raw'
+    }
+    headers_json = {
+        'Authorization': f'token {GIST_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+
+    if GIST_SUBSCRIBERS_URL:
+        try:
+            response = requests.get(GIST_SUBSCRIBERS_URL, headers=headers_raw, timeout=10)
+            if response.status_code == 200:
+                return response.text
+            print(f"从 Gist raw URL 获取邮箱失败: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"从 Gist raw URL 获取邮箱出错: {e}")
+
+    if GIST_ID:
+        try:
+            url = f"https://api.github.com/gists/{GIST_ID}"
+            response = requests.get(url, headers=headers_json, timeout=10)
+            if response.status_code == 200:
+                gist = response.json()
+                file_info = gist.get("files", {}).get(GIST_FILENAME)
+                if not file_info:
+                    print(f"Gist 中找不到订阅文件: {GIST_FILENAME}")
+                    return None
+                return file_info.get("content", "")
+            print(f"从 Gist API 获取邮箱失败: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"从 Gist API 获取邮箱出错: {e}")
+
+    return None
+
+
 def fetch_subscriber_emails():
     """
-    从私有 Gist 获取订阅者邮箱列表
-    如果 Gist 配置不存在，则回退到环境变量 SUBSCRIBER_EMAILS
+    从私有 Gist 获取订阅者邮箱列表。
+    如果 Gist 配置不存在或读取失败，则回退到环境变量 SUBSCRIBER_EMAILS。
     """
-    # 优先从 Gist 读取
-    if GIST_SUBSCRIBERS_URL and GIST_TOKEN:
-        try:
-            headers = {
-                'Authorization': f'token {GIST_TOKEN}',
-                'Accept': 'application/vnd.github.v3.raw'
-            }
-            response = requests.get(GIST_SUBSCRIBERS_URL, headers=headers, timeout=10)
-            if response.status_code == 200:
-                # 支持每行一个邮箱或逗号分隔
-                content = response.text.strip()
-                emails = []
-                for line in content.split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('#'):  # 忽略空行和注释
-                        # 支持逗号分隔的多个邮箱
-                        emails.extend([e.strip() for e in line.split(',') if e.strip()])
-                print(f"从 Gist 获取到 {len(emails)} 个订阅者邮箱")
-                return emails
-            else:
-                print(f"从 Gist 获取邮箱失败: HTTP {response.status_code}")
-        except Exception as e:
-            print(f"从 Gist 获取邮箱出错: {e}")
-    
-    # 回退到环境变量
+    content = fetch_gist_subscriber_content()
+    if content is not None:
+        emails = parse_subscriber_emails(content)
+        print(f"从 Gist 获取到 {len(emails)} 个已确认订阅者邮箱")
+        return emails
+
     fallback_emails = os.environ.get("SUBSCRIBER_EMAILS", "")
     if fallback_emails:
-        emails = [e.strip() for e in fallback_emails.split(",") if e.strip()]
+        emails = parse_subscriber_emails(fallback_emails)
         print(f"使用环境变量 SUBSCRIBER_EMAILS，共 {len(emails)} 个订阅者")
         return emails
-    
+
     return []
 
 def calculate_rsi_ema(prices, period):
@@ -393,15 +458,8 @@ def fetch_rsi_and_price():
     
     return rsi_value, latest_price, latest_date, df
 
-def send_email(to_email, subject, content):
-    """
-    发送邮件函数
-    """
-    if not SENDER_EMAIL or not SENDER_PASSWORD:
-        print("未配置发件人邮箱或密码，跳过发送邮件。")
-        return
-
-    # 构建 HTML 邮件内容
+def build_alert_message(to_header, subject, content):
+    """构建 RSI 提醒邮件。"""
     html_content = f"""
     <html>
     <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f6f9; padding: 20px;">
@@ -425,19 +483,62 @@ def send_email(to_email, subject, content):
     """
 
     message = MIMEText(html_content, 'html', 'utf-8')
-    # RFC5322 要求 From 必须包含可解析的邮箱地址；使用“显示名 <邮箱>”格式
-    message['From'] = Header(f"RSI 监控助手 <{SENDER_EMAIL}>", 'utf-8')
-    message['To'] = Header(to_email, 'utf-8')
+    # 只编码显示名，邮箱地址保持 RFC5322 可解析的 addr-spec。
+    message['From'] = formataddr(("RSI 监控助手", SENDER_EMAIL), charset='utf-8')
+    message['To'] = to_header
     message['Subject'] = Header(subject, 'utf-8')
+    return message
+
+
+def send_email(to_email, subject, content):
+    """发送单个收件人的提醒邮件，保留给临时测试或手动调用。"""
+    return send_email_batch([to_email], subject, content)
+
+
+def send_email_batch(to_emails, subject, content):
+    """通过 BCC 方式向一批收件人发送提醒邮件，收件人彼此不可见。"""
+    recipients = [email.strip() for email in to_emails if email and email.strip()]
+    if not recipients:
+        return 0
+
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        print("未配置发件人邮箱或密码，跳过发送邮件。")
+        return 0
+
+    message = build_alert_message("undisclosed-recipients:;", subject, content)
 
     try:
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, [to_email], message.as_string())
-        server.quit()
-        print(f"邮件已发送至 {to_email}")
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            refused = server.sendmail(SENDER_EMAIL, recipients, message.as_string())
+
+        refused_emails = set(refused.keys()) if refused else set()
+        sent_count = len([email for email in recipients if email not in refused_emails])
+        if refused_emails:
+            print(f"本批部分邮箱被 SMTP 拒绝: {', '.join(refused_emails)}")
+        print(f"邮件批量发送完成: {sent_count}/{len(recipients)}，收件人互相不可见")
+        return sent_count
     except Exception as e:
-        print(f"邮件发送失败: {e}")
+        print(f"邮件批量发送失败 ({', '.join(recipients)}): {e}")
+        return 0
+
+
+def send_email_batches(subscribers, subject, content):
+    """按固定大小分批发送提醒邮件。"""
+    if not subscribers:
+        return 0
+
+    total_sent = 0
+    total_batches = (len(subscribers) + EMAIL_BATCH_SIZE - 1) // EMAIL_BATCH_SIZE
+    for batch_start in range(0, len(subscribers), EMAIL_BATCH_SIZE):
+        batch = subscribers[batch_start:batch_start + EMAIL_BATCH_SIZE]
+        batch_no = batch_start // EMAIL_BATCH_SIZE + 1
+        print(f"发送第 {batch_no}/{total_batches} 批邮件，共 {len(batch)} 个收件人")
+        total_sent += send_email_batch(batch, subject, content)
+        if batch_start + EMAIL_BATCH_SIZE < len(subscribers) and EMAIL_BATCH_DELAY_SECONDS > 0:
+            time.sleep(EMAIL_BATCH_DELAY_SECONDS)
+
+    return total_sent
 
 def send_wechat(title, content):
     """
@@ -507,8 +608,7 @@ def main():
         if not subscribers:
             print("没有配置订阅者邮箱，无法发送。")
         
-        for email in subscribers:
-            send_email(email, subject, content)
+        send_email_batches(subscribers, subject, content)
             
         # 发送微信通知
         send_wechat(subject, content)

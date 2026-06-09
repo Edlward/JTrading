@@ -4,8 +4,8 @@ on:
   push:
     branches: [ "main" ]
   schedule:
-    # 北京时间 09:00 - 15:00 每小时运行一次 (UTC 01:00 - 07:00)
-    - cron: '0 1-7 * * *'
+    # 北京时间 11:00 - 16:00 每小时运行一次 (UTC 01:00 - 07:00)
+    - cron: '0 3-8 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
@@ -34,7 +34,9 @@ jobs:
         SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
         SUBSCRIBER_EMAILS: ${{ secrets.SUBSCRIBER_EMAILS }}
         GIST_SUBSCRIBERS_URL: ${{ secrets.GIST_SUBSCRIBERS_URL }}
-        GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GIST_TOKEN_WRITE }}
+        GIST_ID: ${{ secrets.GIST_ID }}
+        GIST_FILENAME: ${{ secrets.GIST_FILENAME }}
         SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         SUBSCRIBE_WORKER_URL: ${{ secrets.SUBSCRIBE_WORKER_URL }}
         FORMSPREE_ID: ${{ secrets.FORMSPREE_ID }}

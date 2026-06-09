@@ -23,9 +23,32 @@ SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 BUY_THRESHOLD = int(os.environ.get("CONFIRM_BUY_THRESHOLD", os.environ.get("RSI_BUY_THRESHOLD", 32)))
 SELL_THRESHOLD = int(os.environ.get("CONFIRM_SELL_THRESHOLD", os.environ.get("RSI_SELL_THRESHOLD", 77)))
 
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_TOKEN = os.environ.get("GIST_TOKEN") or os.environ.get("GIST_TOKEN_WRITE")
 GIST_ID = os.environ.get("GIST_ID")
-GIST_FILENAME = os.environ.get("GIST_FILENAME", "subscribers.txt")
+GIST_FILENAME = os.environ.get("GIST_FILENAME") or "subscribers.txt"
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def parse_email_list(value):
+    """解析一行里的邮箱，支持逗号、分号和空白分隔。"""
+    emails = []
+    seen = set()
+
+    for candidate in re.split(r"[,;，；\s]+", value.strip()):
+        email = candidate.strip()
+        if not email:
+            continue
+        if not EMAIL_PATTERN.match(email):
+            print(f"跳过无效邮箱: {email}")
+            continue
+
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        emails.append(email)
+
+    return emails
 
 # ==========================================
 # Gist 操作
@@ -156,26 +179,26 @@ def main():
         print("无法获取 Gist 内容")
         return
     
-    lines = content.strip().split('\n')
+    lines = content.splitlines()
     pending_emails = []
-    new_lines = []
+    line_items = []
     
     # 查找 [pending] 标记的邮箱
     for line in lines:
         line = line.strip()
         if not line or line.startswith('#'):
-            new_lines.append(line)
+            line_items.append(("literal", line))
             continue
         
         # 匹配 [pending] email@xxx.com
         match = re.match(r'^\[pending\]\s*(.+)$', line, re.IGNORECASE)
         if match:
-            email = match.group(1).strip()
-            pending_emails.append(email)
-            # 发送成功后移除 [pending] 标记
-            new_lines.append(email)
+            emails = parse_email_list(match.group(1))
+            for email in emails:
+                pending_emails.append(email)
+                line_items.append(("pending", email))
         else:
-            new_lines.append(line)
+            line_items.append(("literal", line))
     
     if not pending_emails:
         print("没有待发送确认邮件的订阅者")
@@ -184,13 +207,25 @@ def main():
     print(f"发现 {len(pending_emails)} 个待确认的订阅者")
     
     # 发送确认邮件
-    success_count = 0
+    success_emails = set()
     for email in pending_emails:
         if send_confirmation_email(email):
-            success_count += 1
+            success_emails.add(email.lower())
+
+    success_count = len(success_emails)
     
-    # 更新 Gist（移除 [pending] 标记）
+    # 更新 Gist：只移除发送成功邮箱的 [pending] 标记，失败的保留下次重试。
     if success_count > 0:
+        new_lines = []
+        for item_type, value in line_items:
+            if item_type == "pending":
+                if value.lower() in success_emails:
+                    new_lines.append(value)
+                else:
+                    new_lines.append(f"[pending] {value}")
+            else:
+                new_lines.append(value)
+
         new_content = '\n'.join(new_lines)
         if update_gist_content(new_content):
             print(f"Gist 已更新，{success_count} 个邮箱已确认")
