@@ -57,6 +57,25 @@ DATA_REQUEST_HEADERS = {
 }
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+EMAIL_IN_TEXT_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def mask_email(email):
+    """日志用邮箱脱敏，不改变实际发送和存储使用的原始邮箱。"""
+    email = str(email or "").strip()
+    local, sep, domain = email.partition("@")
+    if not sep or not local or not domain:
+        return "***"
+    visible = local[:3] if len(local) > 3 else local[:1]
+    return f"{visible}***@{domain}"
+
+
+def mask_email_list(emails):
+    return ", ".join(mask_email(email) for email in emails)
+
+
+def mask_text_emails(text):
+    return EMAIL_IN_TEXT_PATTERN.sub(lambda match: mask_email(match.group(0)), str(text))
 
 
 def load_json_file(file_path):
@@ -163,7 +182,7 @@ def parse_subscriber_emails(content, include_pending=False):
             if not email:
                 continue
             if not EMAIL_PATTERN.match(email):
-                print(f"跳过无效订阅邮箱: {email}")
+                print(f"跳过无效订阅邮箱: {mask_email(email)}")
                 continue
 
             key = email.lower()
@@ -515,11 +534,11 @@ def send_email_batch(to_emails, subject, content):
         refused_emails = set(refused.keys()) if refused else set()
         sent_count = len([email for email in recipients if email not in refused_emails])
         if refused_emails:
-            print(f"本批部分邮箱被 SMTP 拒绝: {', '.join(refused_emails)}")
+            print(f"本批部分邮箱被 SMTP 拒绝: {mask_email_list(refused_emails)}")
         print(f"邮件批量发送完成: {sent_count}/{len(recipients)}，收件人互相不可见")
         return sent_count
     except Exception as e:
-        print(f"邮件批量发送失败 ({', '.join(recipients)}): {e}")
+        print(f"邮件批量发送失败 ({mask_email_list(recipients)}): {mask_text_emails(e)}")
         return 0
 
 

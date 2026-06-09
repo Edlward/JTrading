@@ -27,6 +27,21 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN") or os.environ.get("GIST_TOKEN_WRITE")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_FILENAME = os.environ.get("GIST_FILENAME") or "subscribers.txt"
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+EMAIL_IN_TEXT_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def mask_email(email):
+    """日志用邮箱脱敏，不改变实际发送和 Gist 更新使用的原始邮箱。"""
+    email = str(email or "").strip()
+    local, sep, domain = email.partition("@")
+    if not sep or not local or not domain:
+        return "***"
+    visible = local[:3] if len(local) > 3 else local[:1]
+    return f"{visible}***@{domain}"
+
+
+def mask_text_emails(text):
+    return EMAIL_IN_TEXT_PATTERN.sub(lambda match: mask_email(match.group(0)), str(text))
 
 
 def parse_email_list(value):
@@ -39,7 +54,7 @@ def parse_email_list(value):
         if not email:
             continue
         if not EMAIL_PATTERN.match(email):
-            print(f"跳过无效邮箱: {email}")
+            print(f"跳过无效邮箱: {mask_email(email)}")
             continue
 
         key = email.lower()
@@ -162,10 +177,10 @@ def send_confirmation_email(to_email):
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, [to_email], msg.as_string())
         
-        print(f"✅ 确认邮件已发送至: {to_email}")
+        print(f"确认邮件已发送至: {mask_email(to_email)}")
         return True
     except Exception as e:
-        print(f"❌ 发送邮件失败 ({to_email}): {e}")
+        print(f"发送邮件失败 ({mask_email(to_email)}): {mask_text_emails(e)}")
         return False
 
 # ==========================================
