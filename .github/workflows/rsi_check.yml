@@ -4,8 +4,8 @@ on:
   push:
     branches: [ "main" ]
   schedule:
-    # 北京时间 11:00 - 16:00 每小时运行一次 (UTC 01:00 - 07:00)
-    - cron: '0 3-8 * * *'
+    # 北京时间 11:17 - 16:17 每小时运行一次 (UTC 03:17 - 08:17)
+    - cron: '17 3-8 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:

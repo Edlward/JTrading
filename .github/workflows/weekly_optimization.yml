@@ -2,8 +2,8 @@ name: Weekly Parameter Optimization
 
 on:
   schedule:
-    # 每周六北京时间 10:00 执行（UTC 02:00）
-    - cron: '0 2 * * 6'
+    # 每周六北京时间 10:31 执行（UTC 02:31）
+    - cron: '31 2 * * 6'
   workflow_dispatch:
 
 jobs:

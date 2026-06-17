@@ -2,8 +2,8 @@ name: Send Confirmation Emails
 
 on:
   schedule:
-    # 每小时执行一次（整点）
-    - cron: '0 * * * *'
+    # 每小时第 23 分钟执行一次
+    - cron: '23 * * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
