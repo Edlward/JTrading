@@ -10,7 +10,7 @@
   "signal": "买入",
   "signal_color": "#22c55e",
   "strategy": "RSI(15) EMA 32/77",
-  "backtest_return": "258.24%",
-  "backtest_annual": "18.81%",
-  "timestamp": "2026-06-19 16:40:27 (北京时间)"
+  "backtest_return": "240.81%",
+  "backtest_annual": "17.97%",
+  "timestamp": "2026-06-20 15:08:49 (北京时间)"
 }
