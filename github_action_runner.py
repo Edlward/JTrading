@@ -6,6 +6,7 @@ import time
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
+from html import escape
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
@@ -27,6 +28,7 @@ GIST_ID = os.environ.get("GIST_ID")
 GIST_FILENAME = os.environ.get("GIST_FILENAME") or "subscribers.txt"
 EMAIL_BATCH_SIZE = 10
 EMAIL_BATCH_DELAY_SECONDS = 2
+PROJECT_URL = os.environ.get("PROJECT_URL", "https://pear56.github.io/JTrading").strip() or "https://pear56.github.io/JTrading"
 
 # ==========================================
 # 最优策略参数配置 (来自回测优化结果)
@@ -100,6 +102,20 @@ def load_backtest_summary():
         "dynamic_total": strategy_dynamic.get("total_return"),
         "dynamic_annual": strategy_dynamic.get("annual_return"),
     }
+
+
+def format_percent(value):
+    number = format_number(value, 2)
+    return f"{number}%" if number != "--" else "--"
+
+
+def format_number(value, digits=2):
+    if value is None:
+        return "--"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "--"
 
 
 def load_dynamic_params():
@@ -477,26 +493,143 @@ def fetch_rsi_and_price():
     
     return rsi_value, latest_price, latest_date, df
 
-def build_alert_message(to_header, subject, content):
+def render_multiline_html(content):
+    """将文本内容转换为邮件安全的 HTML 段落。"""
+    blocks = []
+    for block in str(content or "").strip().split("\n\n"):
+        lines = [escape(line.strip()) for line in block.splitlines() if line.strip()]
+        if lines:
+            blocks.append(
+                '<p style="margin: 0 0 14px; font-size: 15px; line-height: 1.7; color: #374151;">'
+                + "<br>".join(lines)
+                + "</p>"
+            )
+    return "".join(blocks) or '<p style="margin: 0; color: #6b7280;">暂无详情。</p>'
+
+
+def build_alert_message(to_header, subject, content, alert_context=None):
     """构建 RSI 提醒邮件。"""
+    alert_context = alert_context or {}
+    action = alert_context.get("action")
+    is_trade_alert = action in ("买入", "卖出")
+
+    if is_trade_alert:
+        is_buy = action == "买入"
+        accent = "#16a34a" if is_buy else "#dc2626"
+        accent_dark = "#166534" if is_buy else "#991b1b"
+        accent_bg = "#ecfdf3" if is_buy else "#fef2f2"
+        headline = "RSI 进入买入关注区" if is_buy else "RSI 进入卖出风险区"
+        direction = "低于买入阈值" if is_buy else "高于卖出阈值"
+        threshold_value = alert_context.get("buy_threshold") if is_buy else alert_context.get("sell_threshold")
+        threshold_label = "买入阈值" if is_buy else "卖出阈值"
+        rsi_text = format_number(alert_context.get("rsi"), 2)
+        price_text = format_number(alert_context.get("price"), 4)
+        period_text = escape(str(alert_context.get("period") or RSI_PERIOD))
+        market_date = escape(str(alert_context.get("market_date") or "--"))
+        buy_threshold = format_number(alert_context.get("buy_threshold"), 0)
+        sell_threshold = format_number(alert_context.get("sell_threshold"), 0)
+        threshold_text = format_number(threshold_value, 0)
+        backtest_return = escape(str(alert_context.get("backtest_return") or "--"))
+        backtest_annual = escape(str(alert_context.get("backtest_annual") or "--"))
+        page_url = escape(PROJECT_URL, quote=True)
+        preheader = escape(f"{ETF_NAME} {ETF_CODE} {action}提醒，RSI {rsi_text}，请查看实时面板。")
+        summary = (
+            f"当前 {escape(ETF_NAME)} ({escape(ETF_CODE)}) 的 RSI({period_text}) EMA 为 "
+            f"<strong style=\"color: {accent_dark};\">{rsi_text}</strong>，已{direction} "
+            f"<strong>{threshold_text}</strong>。"
+        )
+        body_html = f"""
+            <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">{preheader}</div>
+            <div style="background: {accent_bg}; border: 1px solid {accent}; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
+                <div style="font-size: 13px; font-weight: 700; color: {accent_dark}; margin-bottom: 8px;">{action}提醒</div>
+                <h1 style="margin: 0 0 8px; font-size: 24px; line-height: 1.3; color: #111827;">{headline}</h1>
+                <p style="margin: 0; font-size: 15px; line-height: 1.7; color: #374151;">{summary}</p>
+            </div>
+
+            <div style="text-align: center; margin: 24px 0;">
+                <a href="{page_url}" style="display: inline-block; background: {accent}; color: #ffffff; text-decoration: none; font-size: 15px; font-weight: 700; padding: 12px 24px; border-radius: 6px;">查看项目网页</a>
+            </div>
+
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse: collapse; margin: 0 0 22px;">
+                <tr>
+                    <td style="width: 50%; padding: 10px; border: 1px solid #e5e7eb; border-radius: 8px 0 0 0;">
+                        <div style="font-size: 12px; color: #6b7280;">RSI({period_text}) EMA</div>
+                        <div style="font-size: 22px; font-weight: 800; color: #111827; margin-top: 4px;">{rsi_text}</div>
+                    </td>
+                    <td style="width: 50%; padding: 10px; border: 1px solid #e5e7eb; border-left: 0; border-radius: 0 8px 0 0;">
+                        <div style="font-size: 12px; color: #6b7280;">最新价格</div>
+                        <div style="font-size: 22px; font-weight: 800; color: #111827; margin-top: 4px;">{price_text}</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="width: 50%; padding: 10px; border: 1px solid #e5e7eb; border-top: 0; border-radius: 0 0 0 8px;">
+                        <div style="font-size: 12px; color: #6b7280;">买入阈值</div>
+                        <div style="font-size: 18px; font-weight: 700; color: #166534; margin-top: 4px;">RSI &lt; {buy_threshold}</div>
+                    </td>
+                    <td style="width: 50%; padding: 10px; border: 1px solid #e5e7eb; border-left: 0; border-top: 0; border-radius: 0 0 8px 0;">
+                        <div style="font-size: 12px; color: #6b7280;">卖出阈值</div>
+                        <div style="font-size: 18px; font-weight: 700; color: #991b1b; margin-top: 4px;">RSI &gt; {sell_threshold}</div>
+                    </td>
+                </tr>
+            </table>
+
+            <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px;">
+                <div style="font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 8px;">策略参考</div>
+                <p style="margin: 0 0 6px; font-size: 14px; line-height: 1.6; color: #4b5563;">触发条件：{threshold_label}，{direction}。</p>
+                <p style="margin: 0 0 6px; font-size: 14px; line-height: 1.6; color: #4b5563;">数据日期：{market_date}</p>
+                <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #4b5563;">回测表现：总收益 {backtest_return}，年化 {backtest_annual}</p>
+            </div>
+
+            <p style="margin: 0; font-size: 13px; line-height: 1.7; color: #6b7280;">提示：RSI 仅作为参考指标，投资需谨慎，建议结合仓位、估值和市场环境综合判断。</p>
+        """
+    else:
+        page_url = escape(PROJECT_URL, quote=True)
+        subject_html = escape(subject)
+        body_html = f"""
+            <h1 style="margin: 0 0 16px; font-size: 22px; line-height: 1.3; color: #111827;">{subject_html}</h1>
+            {render_multiline_html(content)}
+            <div style="text-align: center; margin: 24px 0;">
+                <a href="{page_url}" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; font-size: 15px; font-weight: 700; padding: 12px 24px; border-radius: 6px;">查看项目网页</a>
+            </div>
+        """
+
+    unsubscribe_email = escape(SENDER_EMAIL or "", quote=True)
     html_content = f"""
+    <!DOCTYPE html>
     <html>
-    <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f6f9; padding: 20px;">
-        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
-            <h2 style="color: #2c3e50; margin-top: 0; border-bottom: 2px solid #3498db; padding-bottom: 10px;">{subject}</h2>
-            
-            <div style="font-size: 16px; line-height: 1.6; color: #34495e; margin: 20px 0;">
-                {content.replace(chr(10), '<br>')}
-            </div>
-            
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ecf0f1; font-size: 12px; color: #95a5a6; text-align: center;">
-                <p>此邮件由 GitHub Actions 自动发送，请勿直接回复。</p>
-                <p>
-                    如果您不想继续接收此类邮件，可以 
-                    <a href="mailto:{SENDER_EMAIL}?subject=取消订阅 RSI 监控&body=请将我的邮箱从订阅列表中移除" style="color: #e74c3c; text-decoration: none; font-weight: bold;">点击此处取消订阅</a>
-                </p>
-            </div>
-        </div>
+    <body style="margin: 0; padding: 0; background-color: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse: collapse; background-color: #f3f4f6;">
+            <tr>
+                <td style="padding: 24px 12px;">
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width: 640px; margin: 0 auto; border-collapse: collapse;">
+                        <tr>
+                            <td style="background: #111827; color: #ffffff; padding: 18px 22px; border-radius: 8px 8px 0 0;">
+                                <div style="font-size: 18px; font-weight: 800; letter-spacing: 0;">JTrading RSI 监控</div>
+                                <div style="font-size: 13px; color: #d1d5db; margin-top: 4px;">{escape(ETF_NAME)} · {escape(ETF_CODE)}</div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="background: #ffffff; padding: 24px 22px; border: 1px solid #e5e7eb; border-top: 0;">
+                                {body_html}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="background: #ffffff; padding: 16px 22px 22px; border: 1px solid #e5e7eb; border-top: 0; border-radius: 0 0 8px 8px; text-align: center;">
+                                <p style="margin: 0 0 8px; font-size: 12px; line-height: 1.6; color: #9ca3af;">此邮件由 GitHub Actions 自动发送，请勿直接回复。</p>
+                                <p style="margin: 0; font-size: 12px; line-height: 1.6; color: #9ca3af;">
+                                    网页无法打开按钮时，可直接访问：
+                                    <a href="{escape(PROJECT_URL, quote=True)}" style="color: #2563eb; text-decoration: none;">{escape(PROJECT_URL)}</a>
+                                </p>
+                                <p style="margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: #9ca3af;">
+                                    如需取消订阅，可
+                                    <a href="mailto:{unsubscribe_email}?subject=取消订阅 RSI 监控&body=请将我的邮箱从订阅列表中移除" style="color: #dc2626; text-decoration: none; font-weight: 700;">点击此处取消订阅</a>
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
     </body>
     </html>
     """
@@ -509,12 +642,12 @@ def build_alert_message(to_header, subject, content):
     return message
 
 
-def send_email(to_email, subject, content):
+def send_email(to_email, subject, content, alert_context=None):
     """发送单个收件人的提醒邮件，保留给临时测试或手动调用。"""
-    return send_email_batch([to_email], subject, content)
+    return send_email_batch([to_email], subject, content, alert_context)
 
 
-def send_email_batch(to_emails, subject, content):
+def send_email_batch(to_emails, subject, content, alert_context=None):
     """通过 BCC 方式向一批收件人发送提醒邮件，收件人彼此不可见。"""
     recipients = [email.strip() for email in to_emails if email and email.strip()]
     if not recipients:
@@ -524,7 +657,7 @@ def send_email_batch(to_emails, subject, content):
         print("未配置发件人邮箱或密码，跳过发送邮件。")
         return 0
 
-    message = build_alert_message("undisclosed-recipients:;", subject, content)
+    message = build_alert_message("undisclosed-recipients:;", subject, content, alert_context)
 
     try:
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
@@ -542,7 +675,7 @@ def send_email_batch(to_emails, subject, content):
         return 0
 
 
-def send_email_batches(subscribers, subject, content):
+def send_email_batches(subscribers, subject, content, alert_context=None):
     """按固定大小分批发送提醒邮件。"""
     if not subscribers:
         return 0
@@ -553,7 +686,7 @@ def send_email_batches(subscribers, subject, content):
         batch = subscribers[batch_start:batch_start + EMAIL_BATCH_SIZE]
         batch_no = batch_start // EMAIL_BATCH_SIZE + 1
         print(f"发送第 {batch_no}/{total_batches} 批邮件，共 {len(batch)} 个收件人")
-        total_sent += send_email_batch(batch, subject, content)
+        total_sent += send_email_batch(batch, subject, content, alert_context)
         if batch_start + EMAIL_BATCH_SIZE < len(subscribers) and EMAIL_BATCH_DELAY_SECONDS > 0:
             time.sleep(EMAIL_BATCH_DELAY_SECONDS)
 
@@ -587,8 +720,12 @@ def main():
 
     print(f"当前状态: RSI={rsi}, 价格={price}")
 
+    backtest_summary = load_backtest_summary()
+    classic_return = format_percent(backtest_summary["classic_total"])
+    classic_annual = format_percent(backtest_summary["classic_annual"])
     subject = ""
     content = ""
+    alert_context = None
 
     if rsi < RSI_BUY_THRESHOLD:
         subject = f"【买入提醒】{ETF_NAME} RSI低于{RSI_BUY_THRESHOLD}"
@@ -600,10 +737,22 @@ def main():
 - 卖出阈值: RSI > {RSI_SELL_THRESHOLD}
 
 💰 回测表现:
-- 总收益: 268.02%
-- 年化收益: 20.90%
+- 总收益: {classic_return}
+- 年化收益: {classic_annual}
 
-当前价格: {price}"""
+当前价格: {price}
+项目网页: {PROJECT_URL}"""
+        alert_context = {
+            "action": "买入",
+            "rsi": rsi,
+            "price": price,
+            "market_date": latest_date,
+            "period": RSI_PERIOD,
+            "buy_threshold": RSI_BUY_THRESHOLD,
+            "sell_threshold": RSI_SELL_THRESHOLD,
+            "backtest_return": classic_return,
+            "backtest_annual": classic_annual,
+        }
     elif rsi > RSI_SELL_THRESHOLD:
         subject = f"【卖出提醒】{ETF_NAME} RSI高于{RSI_SELL_THRESHOLD}"
         content = f"""当前{ETF_NAME} ({ETF_CODE}) 的 RSI({RSI_PERIOD}) EMA 为 {rsi:.2f}，已高于 {RSI_SELL_THRESHOLD}，建议关注卖出风险。
@@ -614,10 +763,22 @@ def main():
 - 卖出阈值: RSI > {RSI_SELL_THRESHOLD}
 
 💰 回测表现:
-- 总收益: 268.02%
-- 年化收益: 20.90%
+- 总收益: {classic_return}
+- 年化收益: {classic_annual}
 
-当前价格: {price}"""
+当前价格: {price}
+项目网页: {PROJECT_URL}"""
+        alert_context = {
+            "action": "卖出",
+            "rsi": rsi,
+            "price": price,
+            "market_date": latest_date,
+            "period": RSI_PERIOD,
+            "buy_threshold": RSI_BUY_THRESHOLD,
+            "sell_threshold": RSI_SELL_THRESHOLD,
+            "backtest_return": classic_return,
+            "backtest_annual": classic_annual,
+        }
     else:
         print(f"RSI 在正常范围内 ({RSI_BUY_THRESHOLD}-{RSI_SELL_THRESHOLD})，无需发送提醒。")
 
@@ -627,7 +788,7 @@ def main():
         if not subscribers:
             print("没有配置订阅者邮箱，无法发送。")
         
-        send_email_batches(subscribers, subject, content)
+        send_email_batches(subscribers, subject, content, alert_context)
             
         # 发送微信通知
         send_wechat(subject, content)
@@ -653,7 +814,6 @@ def main():
         signal = "持有"
         signal_color = "#3b82f6"  # 蓝色
     
-    backtest_summary = load_backtest_summary()
     dynamic_params = load_dynamic_params()
     dynamic_signal = compute_dynamic_signal(rsi, market_df["close"] if market_df is not None else None, dynamic_params)
 
