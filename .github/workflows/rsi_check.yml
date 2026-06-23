@@ -1,6 +1,8 @@
 name: Daily RSI Check
 
 on:
+  push:
+    branches: [ "main" ]
   schedule:
     # 周一到周五北京时间 12:18、13:18、14:18、15:18 运行 (UTC 04:18 - 07:18)
     - cron: '18 4-7 * * 1-5'
