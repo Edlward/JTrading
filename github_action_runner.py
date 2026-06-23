@@ -26,8 +26,7 @@ GIST_SUBSCRIBERS_URL = os.environ.get("GIST_SUBSCRIBERS_URL")
 GIST_TOKEN = os.environ.get("GIST_TOKEN") or os.environ.get("GIST_TOKEN_READ") or os.environ.get("GIST_TOKEN_WRITE")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_FILENAME = os.environ.get("GIST_FILENAME") or "subscribers.txt"
-EMAIL_BATCH_SIZE = 10
-EMAIL_BATCH_DELAY_SECONDS = 2
+EMAIL_SEND_DELAY_SECONDS = float(os.environ.get("EMAIL_SEND_DELAY_SECONDS", os.environ.get("EMAIL_BATCH_DELAY_SECONDS", 2)))
 PROJECT_URL = os.environ.get("PROJECT_URL", "https://pear56.github.io/JTrading").strip() or "https://pear56.github.io/JTrading"
 
 # ==========================================
@@ -648,7 +647,7 @@ def send_email(to_email, subject, content, alert_context=None):
 
 
 def send_email_batch(to_emails, subject, content, alert_context=None):
-    """通过 BCC 方式向一批收件人发送提醒邮件，收件人彼此不可见。"""
+    """逐个收件人单独发送提醒邮件，避免 BCC 批量投递被邮箱服务商丢弃。"""
     recipients = [email.strip() for email in to_emails if email and email.strip()]
     if not recipients:
         return 0
@@ -657,40 +656,38 @@ def send_email_batch(to_emails, subject, content, alert_context=None):
         print("未配置发件人邮箱或密码，跳过发送邮件。")
         return 0
 
-    message = build_alert_message("undisclosed-recipients:;", subject, content, alert_context)
+    sent_count = 0
+    total = len(recipients)
+    for index, email in enumerate(recipients, start=1):
+        message = build_alert_message(email, subject, content, alert_context)
 
-    try:
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            refused = server.sendmail(SENDER_EMAIL, recipients, message.as_string())
+        try:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                refused = server.sendmail(SENDER_EMAIL, [email], message.as_string())
 
-        refused_emails = set(refused.keys()) if refused else set()
-        sent_count = len([email for email in recipients if email not in refused_emails])
-        if refused_emails:
-            print(f"本批部分邮箱被 SMTP 拒绝: {mask_email_list(refused_emails)}")
-        print(f"邮件批量发送完成: {sent_count}/{len(recipients)}，收件人互相不可见")
-        return sent_count
-    except Exception as e:
-        print(f"邮件批量发送失败 ({mask_email_list(recipients)}): {mask_text_emails(e)}")
-        return 0
+            if refused:
+                print(f"第 {index}/{total} 封邮件被 SMTP 拒绝: {mask_email(email)}")
+            else:
+                sent_count += 1
+                print(f"第 {index}/{total} 封邮件发送成功: {mask_email(email)}")
+        except Exception as e:
+            print(f"第 {index}/{total} 封邮件发送失败 ({mask_email(email)}): {mask_text_emails(e)}")
+
+        if index < total and EMAIL_SEND_DELAY_SECONDS > 0:
+            time.sleep(EMAIL_SEND_DELAY_SECONDS)
+
+    print(f"邮件逐封发送完成: {sent_count}/{total}")
+    return sent_count
 
 
 def send_email_batches(subscribers, subject, content, alert_context=None):
-    """按固定大小分批发送提醒邮件。"""
+    """向订阅者逐封发送提醒邮件。"""
     if not subscribers:
         return 0
 
-    total_sent = 0
-    total_batches = (len(subscribers) + EMAIL_BATCH_SIZE - 1) // EMAIL_BATCH_SIZE
-    for batch_start in range(0, len(subscribers), EMAIL_BATCH_SIZE):
-        batch = subscribers[batch_start:batch_start + EMAIL_BATCH_SIZE]
-        batch_no = batch_start // EMAIL_BATCH_SIZE + 1
-        print(f"发送第 {batch_no}/{total_batches} 批邮件，共 {len(batch)} 个收件人")
-        total_sent += send_email_batch(batch, subject, content, alert_context)
-        if batch_start + EMAIL_BATCH_SIZE < len(subscribers) and EMAIL_BATCH_DELAY_SECONDS > 0:
-            time.sleep(EMAIL_BATCH_DELAY_SECONDS)
-
-    return total_sent
+    print(f"准备逐封发送提醒邮件，共 {len(subscribers)} 个收件人")
+    return send_email_batch(subscribers, subject, content, alert_context)
 
 def send_wechat(title, content):
     """
