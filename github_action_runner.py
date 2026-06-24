@@ -210,8 +210,49 @@ def parse_subscriber_emails(content, include_pending=False):
     return emails
 
 
+def summarize_subscriber_content(content):
+    """统计订阅文件中的邮箱状态，帮助排查 Gist 配置或确认流程问题。"""
+    counts = {
+        "confirmed": 0,
+        "pending": 0,
+        "invalid": 0,
+        "duplicates": 0,
+    }
+    seen = set()
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        status = "confirmed"
+        status_match = re.match(r"^\[(pending|confirmed)\]\s*(.+)$", line, re.IGNORECASE)
+        if status_match:
+            status = status_match.group(1).lower()
+            line = status_match.group(2).strip()
+
+        for candidate in re.split(r"[,;，；\s]+", line):
+            email = candidate.strip()
+            if not email:
+                continue
+            if not EMAIL_PATTERN.match(email):
+                counts["invalid"] += 1
+                continue
+
+            key = email.lower()
+            if key in seen:
+                counts["duplicates"] += 1
+                continue
+
+            seen.add(key)
+            counts["pending" if status == "pending" else "confirmed"] += 1
+
+    counts["total_unique"] = counts["confirmed"] + counts["pending"]
+    return counts
+
+
 def fetch_gist_subscriber_content():
-    """优先从 raw URL 读取 Gist；未配置 raw URL 时回退到 Gist API。"""
+    """优先通过 Gist API 读取当前订阅文件；raw URL 仅作为兜底。"""
     if not GIST_TOKEN:
         return None
 
@@ -224,15 +265,6 @@ def fetch_gist_subscriber_content():
         'Accept': 'application/vnd.github.v3+json'
     }
 
-    if GIST_SUBSCRIBERS_URL:
-        try:
-            response = requests.get(GIST_SUBSCRIBERS_URL, headers=headers_raw, timeout=10)
-            if response.status_code == 200:
-                return response.text
-            print(f"从 Gist raw URL 获取邮箱失败: HTTP {response.status_code}")
-        except Exception as e:
-            print(f"从 Gist raw URL 获取邮箱出错: {e}")
-
     if GIST_ID:
         try:
             url = f"https://api.github.com/gists/{GIST_ID}"
@@ -243,10 +275,21 @@ def fetch_gist_subscriber_content():
                 if not file_info:
                     print(f"Gist 中找不到订阅文件: {GIST_FILENAME}")
                     return None
+                print(f"通过 Gist API 读取订阅文件: {GIST_FILENAME}")
                 return file_info.get("content", "")
             print(f"从 Gist API 获取邮箱失败: HTTP {response.status_code}")
         except Exception as e:
             print(f"从 Gist API 获取邮箱出错: {e}")
+
+    if GIST_SUBSCRIBERS_URL:
+        try:
+            response = requests.get(GIST_SUBSCRIBERS_URL, headers=headers_raw, timeout=10)
+            if response.status_code == 200:
+                print("通过 GIST_SUBSCRIBERS_URL 读取订阅文件")
+                return response.text
+            print(f"从 Gist raw URL 获取邮箱失败: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"从 Gist raw URL 获取邮箱出错: {e}")
 
     return None
 
@@ -259,6 +302,15 @@ def fetch_subscriber_emails():
     content = fetch_gist_subscriber_content()
     if content is not None:
         emails = parse_subscriber_emails(content)
+        summary = summarize_subscriber_content(content)
+        print(
+            "订阅文件统计: "
+            f"confirmed={summary['confirmed']}, "
+            f"pending={summary['pending']}, "
+            f"invalid={summary['invalid']}, "
+            f"duplicates={summary['duplicates']}, "
+            f"total_unique={summary['total_unique']}"
+        )
         print(f"从 Gist 获取到 {len(emails)} 个已确认订阅者邮箱")
         return emails
 
